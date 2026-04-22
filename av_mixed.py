@@ -1,0 +1,601 @@
+#%%
+from mpi4py import MPI
+from dolfinx import fem
+from dolfinx.mesh import meshtags
+from dolfinx.fem import (
+    Function,
+    form,
+)
+from dolfinx.fem.petsc import assemble_matrix, assemble_vector, apply_lifting, set_bc
+import numpy as np
+from ufl import curl, inner, grad
+from basix.ufl import element
+from petsc4py import PETSc
+from dolfinx.cpp.fem.petsc import discrete_gradient, interpolation_matrix
+from utils import L2_norm, par_print
+import ufl
+from dolfinx.fem import (
+    functionspace,
+    bcs_by_block,
+    extract_function_spaces,
+)
+from utils import convert_facet_tags
+from dolfinx.mesh import create_submesh
+from dolfinx.io import XDMFFile
+from utils import interpolate_by_tags
+from dolfinx import default_scalar_type
+from dolfinx.io import VTXWriter
+from dolfinx.fem import assemble_scalar
+
+comm = MPI.COMM_WORLD
+degree = 1
+
+with XDMFFile(comm, "team24_horseshoe.xdmf", "r") as xdmf:
+    mesh = xdmf.read_mesh()
+    ct   = xdmf.read_meshtags(mesh, name="Cell_markers")
+    tdim = mesh.topology.dim
+    fdim = tdim - 1
+    mesh.topology.create_entities(fdim)
+    ft   = xdmf.read_meshtags(mesh, name="Facet_markers")
+
+
+ti = 0.0  # Start time
+T = 0.1  # End time
+
+frequency = 50.0
+steps_per_period = 100
+d_t = 1.0 / (frequency * steps_per_period)
+
+n_cycles_warmup = 10
+n_cycles_measure = 1
+num_steps = int((n_cycles_warmup + n_cycles_measure) / (frequency * d_t))
+
+warmup_steps = n_cycles_warmup * steps_per_period
+
+
+dt = fem.Constant(mesh, d_t)
+t = fem.Constant(mesh, ti)
+
+
+mesh.topology.create_connectivity(fdim, tdim)
+mesh.topology.create_connectivity(tdim, tdim)
+mesh.topology.create_connectivity(tdim - 1, 0)
+
+
+domains = {
+    "air": 1,
+    "coil1": 2,
+    "coil2": 3,
+    "rotor": 4,
+    "stator": 5,
+}
+
+boundary = {
+    "outer": 1,
+    "symmetry": 2,
+    "coil1_in": 3,
+    "coil1_out": 4,
+    "coil2_in": 5,
+    "coil2_out": 6,
+    "rotor_outer": 7,
+    "stator_outer": 8,
+}
+
+sigma_air = fem.Constant(mesh, default_scalar_type(0.0))
+sigma_copper = fem.Constant(mesh, default_scalar_type(5.96e7))
+sigma_stator = fem.Constant(mesh, default_scalar_type(1e5))
+sigma_rotor = fem.Constant(mesh, default_scalar_type(1e5))
+
+sigma_values = {
+    domains["air"]: sigma_air,
+    domains["coil1"]: sigma_copper,
+    domains["coil2"]: sigma_copper,
+    domains["rotor"]: sigma_rotor,
+    domains["stator"]: sigma_stator,
+}
+
+mu = 4e-7 * np.pi
+mu_r_iron = 1000.0
+
+nu_value_air = fem.Constant(mesh, default_scalar_type(1.0 / mu))
+nu_value_iron = fem.Constant(mesh, default_scalar_type(1.0 / (mu_r_iron * mu)))
+
+nu_values = {
+    domains["air"]:    nu_value_air,
+    domains["coil1"]:  nu_value_air,
+    domains["coil2"]:  nu_value_air,
+    domains["rotor"]:  nu_value_iron,
+    domains["stator"]: nu_value_iron,
+}
+
+DG0 = fem.functionspace(mesh, ("DG", 0))  # Piecewise constant function space
+
+sigma = fem.Function(DG0)
+nu = fem.Function(DG0)
+
+interpolate_by_tags(sigma, sigma_values, ct)
+interpolate_by_tags(nu, nu_values, ct)
+
+
+#%%
+target_tags = [domains["coil1"], domains["coil2"], domains["rotor"], domains["stator"]]
+cell_lists = [ct.find(tag) for tag in target_tags]
+conductive_cells = np.unique(np.concatenate(cell_lists)).astype(np.int32)
+
+submesh_conductive, subdomain_conductive_to_domain = create_submesh(mesh, tdim, conductive_cells)[:2]
+entity_maps = [subdomain_conductive_to_domain]
+
+nedelec_elem = element("N1curl", mesh.basix_cell(), degree)
+V = fem.functionspace(mesh, nedelec_elem)
+V_submesh = functionspace(submesh_conductive, nedelec_elem)
+
+lagrange_elem = element("Lagrange", submesh_conductive.basix_cell(), degree)
+V1 = fem.functionspace(submesh_conductive, lagrange_elem)
+
+
+# Boundary conditions
+
+omega = 2.0 * np.pi * frequency
+V_in = 10.0
+
+high_expr = fem.Expression(
+    V_in * ufl.sin(omega * t), V1.element.interpolation_points
+)
+
+high_expr_minus = fem.Expression(
+    -V_in * ufl.sin(omega * t), V1.element.interpolation_points
+)
+
+
+outer_boundaries = [boundary["outer"], boundary["symmetry"], boundary["coil1_out"], boundary["coil2_out"], boundary["coil1_in"], boundary["coil2_in"]]
+outer_boundary_tags = np.unique(np.concatenate([ft.find(tag) for tag in outer_boundaries]))
+
+bdofs_outer = fem.locate_dofs_topological(V, entity_dim=fdim, entities=outer_boundary_tags)
+outer_func = fem.Function(V)
+outer_func.x.array[:] = 0.0
+bc1 = fem.dirichletbc(outer_func, bdofs_outer)
+
+conductive_ft = convert_facet_tags(submesh_conductive, subdomain_conductive_to_domain, ft)
+submesh_conductive.topology.create_connectivity(fdim, tdim)
+
+coil1_in = conductive_ft.find(boundary["coil1_in"])
+bdofs_coil1_in = fem.locate_dofs_topological(V1, entity_dim=fdim, entities=coil1_in)
+coil1_in_func = fem.Function(V1)
+# coil1_in_func.x.array[:] = 1.0
+coil1_in_func.interpolate(high_expr)
+bc2 = fem.dirichletbc(coil1_in_func, bdofs_coil1_in)
+
+coil1_out = conductive_ft.find(boundary["coil1_out"])
+bdofs_coil1_out = fem.locate_dofs_topological(V1, entity_dim=fdim, entities=coil1_out)
+coil1_out_func = fem.Function(V1)
+coil1_out_func.x.array[:] = 0.0
+bc3 = fem.dirichletbc(coil1_out_func, bdofs_coil1_out)
+
+coil2_in = conductive_ft.find(boundary["coil2_in"])
+bdofs_coil2_in = fem.locate_dofs_topological(V1, entity_dim=fdim, entities=coil2_in)
+coil2_in_func = fem.Function(V1)
+# coil2_in_func.x.array[:] = -1.0
+coil2_in_func.interpolate(high_expr_minus)
+bc4 = fem.dirichletbc(coil2_in_func, bdofs_coil2_in)
+
+coil2_out = conductive_ft.find(boundary["coil2_out"])
+bdofs_coil2_out = fem.locate_dofs_topological(V1, entity_dim=fdim, entities=coil2_out)
+coil2_out_func = fem.Function(V1)
+coil2_out_func.x.array[:] = 0.0
+bc5 = fem.dirichletbc(coil2_out_func, bdofs_coil2_out)
+
+bcs = [bc1, bc2, bc3, bc4, bc5]
+
+
+u = ufl.TrialFunction(V)
+v = ufl.TestFunction(V)
+
+u1 = ufl.TrialFunction(V1)
+v1 = ufl.TestFunction(V1)
+
+u_n = fem.Function(V)
+u_n1 = fem.Function(V1)
+u_n_prev  = fem.Function(V)
+u_n_submesh = fem.Function(V_submesh)
+
+
+u_n_prev.x.array[:] = u_n.x.array[:]
+u_n_prev.x.scatter_forward()
+
+u_n_submesh_prev = fem.Function(V_submesh)
+u_n_submesh_prev.x.array[:] = u_n_submesh.x.array[:]
+u_n_submesh_prev.x.scatter_forward()
+
+
+dx = ufl.Measure("dx", domain=mesh, subdomain_data=ct)
+
+whole = (1,2,3,4,5)
+omega_c = (2,3,4,5)
+
+a00 = dt * inner(nu * curl(u), curl(v)) * dx(whole) + inner(sigma * u, v) * dx(whole)
+
+a01 = dt * inner(sigma * grad(u1), v) * dx(omega_c)
+a10 = inner(sigma * grad(v1), u) * dx(omega_c)
+
+a11 = dt * inner(sigma * grad(u1), grad(v1)) * dx(omega_c)
+
+L0 = inner(sigma * u_n, v) * dx(whole)
+L1 = inner(grad(v1), sigma * u_n) * dx(omega_c)
+
+a = form([[a00, a01], [a10, a11]], entity_maps=entity_maps)
+L = form([L0, L1], entity_maps=entity_maps)
+
+# Solver steps
+
+A_mat = assemble_matrix(a, bcs=bcs)
+A_mat.assemble()
+
+b = assemble_vector(L)
+bcs1 = bcs_by_block(extract_function_spaces(a, 1), bcs)
+apply_lifting(b, a, bcs=bcs1)
+b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+bcs0 = bcs_by_block(extract_function_spaces(L), bcs)
+set_bc(b, bcs0)
+
+a_p = form([[a00, None], [None, a11]], entity_maps=entity_maps)
+P = assemble_matrix(a_p, bcs=bcs)
+P.assemble()
+
+u_map = V.dofmap.index_map
+u1_map = V1.dofmap.index_map
+
+offset_u = u_map.local_range[0] * V.dofmap.index_map_bs + u1_map.local_range[0]
+offset_u1 = offset_u + u_map.size_local * V.dofmap.index_map_bs
+
+is_u = PETSc.IS().createStride(
+    u_map.size_local * V.dofmap.index_map_bs, offset_u, 1, comm=mesh.comm
+)
+is_u1 = PETSc.IS().createStride(u1_map.size_local, offset_u1, 1, comm=mesh.comm)
+
+ksp = PETSc.KSP().create(mesh.comm)
+ksp.setOperators(A_mat, P)
+ksp.setType("fgmres")
+ksp.setGMRESRestart(100)
+ksp.setTolerances(rtol=1e-12, atol=1e-8, max_it=100)
+ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
+ksp.getPC().setType("fieldsplit")
+ksp.getPC().setFieldSplitType(PETSc.PC.CompositeType.MULTIPLICATIVE)
+ksp.getPC().setFieldSplitIS(("u", is_u), ("u1", is_u1))
+ksp_u, ksp_u1 = ksp.getPC().getFieldSplitSubKSP()
+
+ksp_u.setType("preonly")
+ksp_u.getPC().setType("hypre")
+ksp_u.getPC().setHYPREType("ams")
+
+W = fem.functionspace(mesh, ("Lagrange", degree))
+G = discrete_gradient(W._cpp_object, V._cpp_object)
+G.assemble()
+ksp_u.getPC().setHYPREDiscreteGradient(G)
+
+if degree == 1:
+    cvec_0 = Function(V)
+    cvec_0.interpolate(
+        lambda x: np.vstack(
+            (np.ones_like(x[0]), np.zeros_like(x[0]), np.zeros_like(x[0]))
+        )
+    )
+    cvec_1 = Function(V)
+    cvec_1.interpolate(
+        lambda x: np.vstack(
+            (np.zeros_like(x[0]), np.ones_like(x[0]), np.zeros_like(x[0]))
+        )
+    )
+    cvec_2 = Function(V)
+    cvec_2.interpolate(
+        lambda x: np.vstack(
+            (np.zeros_like(x[0]), np.zeros_like(x[0]), np.ones_like(x[0]))
+        )
+    )
+    ksp_u.getPC().setHYPRESetEdgeConstantVectors(
+        cvec_0.x.petsc_vec, cvec_1.x.petsc_vec, cvec_2.x.petsc_vec
+    )
+
+else:
+    shape = (mesh.geometry.dim,)
+    Q = fem.functionspace(mesh, ("Lagrange", degree, shape))
+    Pi = interpolation_matrix(Q._cpp_object, V._cpp_object)
+    Pi.assemble()
+    ksp_u.getPC().setHYPRESetInterpolations(dim=mesh.geometry.dim, ND_Pi_Full=Pi)
+
+
+ksp.setOptionsPrefix("main_") # Add this line
+
+opts = PETSc.Options()
+opts[f"{ksp.getOptionsPrefix()}ksp_monitor_true_residual"] = None
+opts[f"{ksp_u.prefix}pc_hypre_ams_cycle_type"] = 1
+opts[f"{ksp_u.prefix}pc_hypre_ams_tol"] = 0
+opts[f"{ksp_u.prefix}pc_hypre_ams_max_iter"] = 1
+opts[f"{ksp_u.prefix}pc_hypre_ams_amg_beta_theta"] = 0.25
+opts[f"{ksp_u.prefix}pc_hypre_ams_print_level"] = 0
+opts[f"{ksp_u.prefix}pc_hypre_ams_amg_alpha_options"] = "10,2,6,6,6"
+opts[f"{ksp_u.prefix}pc_hypre_ams_amg_beta_options"] = "10,1,6,6,4"
+opts[f"{ksp_u.prefix}pc_hypre_ams_relax_type"] = 8
+opts[f"{ksp_u.prefix}pc_hypre_ams_relax_weight"] = 1.0
+opts[f"{ksp_u.prefix}pc_hypre_ams_relax_times"] = 2
+opts[f"{ksp_u.prefix}pc_hypre_ams_omega"] = 1.0
+opts[f"{ksp_u.prefix}pc_hypre_ams_projection_frequency"] = 100000
+
+V_interior = fem.functionspace(mesh, ("CG", degree))
+interior_nodes_array = fem.Function(V_interior)
+
+interior_nodes_array.x.array[:] = 1.0
+interior_nodes_array.x.scatter_forward()
+
+dofmap = W.dofmap
+num_dofs_per_cell = dofmap.dof_layout.num_dofs
+cell_dofs = dofmap.list.reshape(-1, num_dofs_per_cell)
+
+tags = omega_c
+tagged_cells = np.unique(np.concatenate([ct.find(tag) for tag in tags]))
+
+tagged_cell_dofs = cell_dofs[tagged_cells].flatten()
+unique_dofs = np.unique(tagged_cell_dofs)
+
+interior_nodes_array.x.array[unique_dofs] = 0.0
+interior_nodes_array.x.scatter_forward()
+
+ksp_u.getPC().setHYPREAMSSetInteriorNodes(interior_nodes_array.x.petsc_vec)
+
+ksp_u.setFromOptions()
+
+ksp_u1.setType("preonly")
+ksp_u1.getPC().setType("hypre")
+ksp_u1.getPC().setHYPREType("boomeramg")
+
+ksp_u1.setFromOptions()
+
+ksp.setFromOptions()
+ksp.setUp()
+ksp_u.getPC().setUp()
+ksp_u1.getPC().setUp()
+
+sol = A_mat.createVecRight()
+
+
+par_print(mesh.comm, "about to solve")
+ksp.solve(b, sol)
+
+
+reason = ksp.getConvergedReason()
+par_print(mesh.comm, f"KSP converged with reason {reason}")
+
+uh, uh1 = Function(V), Function(V1)
+offset = V.dofmap.index_map.size_local * V.dofmap.index_map_bs
+
+uh.x.array[:offset] = sol.array_r[:offset]
+uh1.x.array[: (len(sol.array_r) - offset)] = sol.array_r[offset:]
+
+uh.x.scatter_forward()
+uh1.x.scatter_forward()
+
+u_n.x.array[:] = uh.x.array
+u_n1.x.array[:] = uh1.x.array
+
+u_n.x.scatter_forward()
+u_n1.x.scatter_forward()
+
+par_print(mesh.comm, f"Residual norm: {ksp.getResidualNorm()}")
+
+# Output results for visualization
+
+vector_vis = fem.functionspace(
+    mesh, ("Discontinuous Lagrange", degree, (mesh.geometry.dim,))
+)
+
+B = ufl.curl(u_n)
+B_vis = Function(vector_vis)
+B_file = VTXWriter(mesh.comm, "B_field.bp", B_vis, "BP4")
+Bexpr = fem.Expression(B, vector_vis.element.interpolation_points)
+B_vis.interpolate(Bexpr)
+B_file.write(t)
+
+u_n1_file = VTXWriter(mesh.comm, "V_field.bp", u_n1, "BP4")
+u_n1_file.write(t)
+
+DG_submesh_vis = fem.functionspace(
+    submesh_conductive, ("Discontinuous Lagrange", degree, (submesh_conductive.geometry.dim,))
+)
+
+smsh_cell_imap = submesh_conductive.topology.index_map(tdim)
+smsh_cells = np.arange(smsh_cell_imap.size_local + smsh_cell_imap.num_ghosts)
+parent_cells = subdomain_conductive_to_domain.sub_topology_to_topology(smsh_cells, inverse=False)
+
+u_n_submesh.interpolate(u_n, cells0=parent_cells, cells1=smsh_cells)
+dt_submesh = fem.Constant(submesh_conductive, d_t)
+da_dt_submesh = (u_n_submesh - u_n_submesh_prev) / dt_submesh
+
+
+da_dt_vis = fem.Function(DG_submesh_vis)
+da_dt_expr = fem.Expression(da_dt_submesh, DG_submesh_vis.element.interpolation_points)
+da_dt_vis.interpolate(da_dt_expr)
+da_dt_file = VTXWriter(mesh.comm, "da_dt_submesh.bp", da_dt_vis, "BP4")
+da_dt_file.write(t)
+
+
+
+# B on submesh
+B_vis_submesh = fem.Function(DG_submesh_vis)
+B_vis_submesh.interpolate(
+    B_vis, cells0=parent_cells, cells1=smsh_cells
+)
+B_file_submesh = VTXWriter(mesh.comm, "B_submesh.bp", B_vis_submesh, "BP4")
+B_file_submesh.write(t)
+
+E = -grad(u_n1) - da_dt_submesh
+# E_vis = Function(DG_submesh_vis)
+# Eexpr = fem.Expression(E, DG_submesh_vis.element.interpolation_points)
+# E_vis.interpolate(E_expr)
+# E_vis.x.scatter_forward()
+# E_file = VTXWriter(mesh.comm, "E_field.bp", E_vis, "BP4")
+# E_file.write(t)
+
+
+DG_0_submesh_vis = fem.functionspace(submesh_conductive, ("DG", 0))
+sigma_submesh = fem.Function(DG_0_submesh_vis)
+sigma_submesh.interpolate(
+    sigma, cells0=parent_cells, cells1=smsh_cells
+)
+
+J = sigma_submesh * E
+J_vis = fem.Function(DG_submesh_vis)
+Jexpr = fem.Expression(J, DG_submesh_vis.element.interpolation_points)
+J_vis.interpolate(Jexpr)
+J_file = VTXWriter(mesh.comm, "J_field.bp", J_vis, "BP4")
+J_file.write(t)
+
+
+
+# Find stator cells in the parent mesh
+stator_cells_parent = ct.find(domains["stator"])  # tag 5
+all_smsh_cells = np.arange(smsh_cell_imap.size_local + smsh_cell_imap.num_ghosts)
+all_parent_cells = subdomain_conductive_to_domain.sub_topology_to_topology(all_smsh_cells, inverse=False)
+
+# Find which submesh cells correspond to stator (tag 5)
+stator_mask = np.isin(all_parent_cells, stator_cells_parent)
+stator_smsh_cells = all_smsh_cells[stator_mask].astype(np.int32)
+
+# Build a meshtag on the submesh for tag 5
+submesh_ct_stator = meshtags(
+    submesh_conductive, tdim, stator_smsh_cells,
+    np.full(len(stator_smsh_cells), domains["stator"], dtype=np.int32)
+)
+
+# Measure restricted to stator on submesh
+dx_stator = ufl.Measure("dx", domain=submesh_conductive, subdomain_data=submesh_ct_stator)
+
+# L2 norm of da_dt_submesh on stator cells only
+da_dt_stator_norm = np.sqrt(
+    MPI.COMM_WORLD.allreduce(
+        assemble_scalar(form(inner(da_dt_submesh, da_dt_submesh) * dx_stator(domains["stator"]))),
+        op=MPI.SUM
+    )
+)
+par_print(mesh.comm, f"L2 norm of da_dt on stator (tag 5): {da_dt_stator_norm}")
+
+last_steps = 1
+
+
+
+for n in range(1):
+
+    par_print(comm, "\n")
+
+    t.value += d_t
+    par_print(comm, f"Time step {n+1}: t = {t.value}")
+    ksp_u.getPC().HYPREAMSResetSolveCounter()
+
+    u_n_prev.x.array[:] = u_n.x.array[:]
+    u_n_submesh_prev.x.array[:] = u_n_submesh.x.array[:]
+
+    uh.x.array[:] = 0
+    uh1.x.array[:] = 0
+
+    high_expr = fem.Expression(
+    V_in * ufl.sin(omega * t), V1.element.interpolation_points)
+
+    high_expr_minus = fem.Expression(
+        -V_in * ufl.sin(omega * t), V1.element.interpolation_points
+    )
+
+    coil1_in_func.interpolate(high_expr)
+    coil2_in_func.interpolate(high_expr_minus)
+
+    bcs = [bc1, bc2, bc3, bc4, bc5]
+
+    b = assemble_vector(L)
+    bcs1 = bcs_by_block(extract_function_spaces(a, 1), bcs)
+    apply_lifting(b, a, bcs=bcs1)
+    b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+    bcs0 = bcs_by_block(extract_function_spaces(L), bcs)
+    set_bc(b, bcs0)
+
+    sol = A_mat.createVecRight()
+
+
+    par_print(comm, f"A_mat norm: {A_mat.norm()}")
+    par_print(comm, f"no of dofs in u: {V.dofmap.index_map.size_global}")
+    par_print(comm, f"norm of b: {b.norm()}")
+
+    ksp.solve(b, sol)
+
+    uh.x.array[:offset] = sol.array_r[:offset]
+    uh1.x.array[:(len(sol.array_r) - offset)] = sol.array_r[offset:]
+
+    uh.x.scatter_forward()
+    uh1.x.scatter_forward()
+
+    u_n.x.array[:] = uh.x.array
+    u_n1.x.array[:] = uh1.x.array
+
+    u_n.x.scatter_forward()
+    u_n1.x.scatter_forward()
+
+    reason = ksp.getConvergedReason()
+    par_print(comm, f"Converged reason: {reason}")
+
+    res = ksp.getResidualNorm()
+    par_print(comm, f"Final residual: {res}")
+
+    u_n_submesh.interpolate(u_n, cells0=parent_cells, cells1=smsh_cells)
+
+    par_print(comm, f"L2 norm of u_n_submesh is {L2_norm(u_n_submesh)}")
+    par_print(comm, f"L2 norm of u_n_submesh_prev is {L2_norm(u_n_submesh_prev)}")
+    par_print(comm, f"L2 norm of da_dt_submesh is {L2_norm(da_dt_submesh)}")
+
+
+    B = curl(u_n)
+    u_n_submesh.interpolate(u_n, cells0=parent_cells, cells1=smsh_cells)
+    da_dt_submesh = (u_n_submesh - u_n_submesh_prev) / dt_submesh
+    E = -grad(u_n1) - da_dt_submesh
+    J_ind = sigma_submesh * E
+
+
+    da_dt_stator_norm = np.sqrt(
+    MPI.COMM_WORLD.allreduce(
+        assemble_scalar(form(inner(da_dt_submesh, da_dt_submesh) * dx_stator(domains["stator"]))),
+        op=MPI.SUM
+    )
+    )
+    par_print(mesh.comm, f"L2 norm of da_dt on stator (tag 5): {da_dt_stator_norm}")
+
+    # par_print(comm, f"L2 norm of B is {L2_norm(B)}")
+    # par_print(comm, f"L2 norm of E is {L2_norm(E)}")
+    # par_print(comm, f"L2 norm of J is {L2_norm(J_ind)}")
+
+
+    # if n >= num_steps - last_steps:
+    if n >0:
+        par_print(comm, "Writing output files...")
+        
+        Bexpr = fem.Expression(B, vector_vis.element.interpolation_points)
+        B_vis.interpolate(Bexpr)
+        B_file.write(t.value)
+
+        B_vis_submesh.interpolate(B_vis, cells0=parent_cells, cells1=smsh_cells)
+        B_file_submesh.write(t)
+
+        # Eexpr = fem.Expression(E, vector_vis.element.interpolation_points)
+        # E_vis.interpolate(Eexpr)
+        # E_file.write(t.value)
+
+        da_dt_expr = fem.Expression(da_dt_submesh, DG_submesh_vis.element.interpolation_points)
+        da_dt_vis.interpolate(da_dt_expr)
+        da_dt_file.write(t)
+
+        Jexpr = fem.Expression(J_ind, vector_vis.element.interpolation_points)
+        J_vis.interpolate(Jexpr)
+        J_file.write(t.value)
+        
+        u_n1_file.write(t.value)
+
+B_file.close()
+B_file_submesh.close()
+J_file.close()
+u_n1_file.close()
+# E_file.close()
+
