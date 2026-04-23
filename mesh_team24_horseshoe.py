@@ -220,50 +220,16 @@ gmsh.model.addPhysicalGroup(2, [57], tag= boundary_tags["symmetry"])
 gmsh.model.addPhysicalGroup(2, [55, 56, 58, 59, 60], tag= boundary_tags["outer"])
 
 
-# gmsh.model.mesh.setSize(gmsh.model.getEntities(0), 5)
+gmsh.model.mesh.setSize(gmsh.model.getEntities(0), 10)  # global coarse
 
-# ── Global background size (coarse everywhere first) ──────────────────────
-gmsh.model.mesh.setSize(gmsh.model.getEntities(0), 10)
+def get_points(vol_tags):
+    pts = gmsh.model.getBoundary([(3, v) for v in vol_tags], oriented=False, recursive=True)
+    return [(0, tag) for _, tag in pts]
 
-# ── Collect bounding curves/surfaces of the regions you care about ────────
-def get_boundary_curves(vol_tag):
-    """Return all curve tags on the boundary of a volume."""
-    surfs = gmsh.model.getBoundary([(3, vol_tag)], oriented=False)
-    curves = []
-    for s in surfs:
-        curves += [c for _, c in gmsh.model.getBoundary([s], oriented=False)]
-    return list(set(curves))
-
-coil1_curves  = get_boundary_curves(coil1_entities[0])
-coil2_curves  = get_boundary_curves(coil2_entities[0])
-stator_curves = [c for vol in stator_entities for c in get_boundary_curves(vol)]
-rotor_curves  = [c for vol in rotor_entities  for c in get_boundary_curves(vol)]
-
-all_refined_curves = list(set(coil1_curves + coil2_curves + stator_curves + rotor_curves))
-
-# ── Field 1: distance from the refined-region edges ───────────────────────
-gmsh.model.mesh.field.add("Distance", 1)
-gmsh.model.mesh.field.setNumbers(1, "CurvesList", all_refined_curves)
-gmsh.model.mesh.field.setNumber(1, "Sampling", 100)
-
-# ── Field 2: threshold — fine close in, coarse far out ────────────────────
-gmsh.model.mesh.field.add("Threshold", 2)
-gmsh.model.mesh.field.setNumber(2, "InField",   1)
-gmsh.model.mesh.field.setNumber(2, "SizeMin",   1.5)   # fine size at the surfaces
-gmsh.model.mesh.field.setNumber(2, "SizeMax",   10.0)  # coarse size in bulk air
-gmsh.model.mesh.field.setNumber(2, "DistMin",   3.0)   # stay fine within 3 mm
-gmsh.model.mesh.field.setNumber(2, "DistMax",   20.0)  # fully coarse beyond 20 mm
-
-# ── Apply as the background field ─────────────────────────────────────────
-gmsh.model.mesh.field.setAsBackgroundMesh(2)
-
-# Prevent gmsh from overriding the field with CAD-based sizes
-gmsh.option.setNumber("Mesh.MeshSizeFromPoints",    0)
-gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
-gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
-
-gmsh.model.mesh.generate(3)
-
+gmsh.model.mesh.setSize(get_points(coil1_entities),  3.0)
+gmsh.model.mesh.setSize(get_points(coil2_entities),  3.0)
+gmsh.model.mesh.setSize(get_points(stator_entities), 3.0)
+gmsh.model.mesh.setSize(get_points(rotor_entities),  3.0)
 
 
 gmsh.model.mesh.generate(3)
