@@ -1,4 +1,3 @@
-# %%
 import numpy as np
 import gmsh
 from dolfinx.io import XDMFFile
@@ -138,20 +137,24 @@ gmsh.model.add("team24_horseshoe")
 
 
 H = 25.4
-M = 35.0
+M = 150.0 # Height of the outer air box
+W = 150.0 # Half width of outer air box
 D = 63 - 17.0 / 2.0
 
 air_z0 = -M
 air_dz = H + 2 * M
 z_top = air_z0 + air_dz
 
-height = 63.4 # 95.4 - radius of coil (24) - (M - 27.0)
+r_coil = 24.0
+coil_z_offset = 27.0  # the magnitude of the z translation
+
+height = H + M + coil_z_offset - r_coil
 
 coil1 = coil_horseshoe(24.0, 34.0, height, 17.0, open_end="top")
 gmsh.model.occ.rotate([(3, coil1[1])], 0, 0, 0, 1, 0, 0, np.pi / 2.0)
 gmsh.model.occ.translate([(3, coil1[1])], -41.0, -D, -27.0)
 
-height_2_offset = 32.4
+height_2_offset = height - 31.0
 
 coil2 = coil_horseshoe(24.0, 34.0, 31.0 + height_2_offset, 17.0, open_end="bottom")
 gmsh.model.occ.rotate([(3, coil2[1])], 0, 0, 0, 1, 0, 0, -np.pi / 2.0)
@@ -163,52 +166,39 @@ gmsh.model.occ.rotate([rotor1[0][0]], 0, 0, 0, 0, 0, 1, -22.0 * np.pi / 180.0)
 r_champ = 5.0
 stator1 = stator(H, r_champ)
 
-outer_box = gmsh.model.occ.addBox(-120, -120, -M, 240, 240, H + 2 * M)
+outer_box = gmsh.model.occ.addBox(-W, -W, -M, 2 * W, 2 * W, H + 2 * M)
 
-parts = gmsh.model.occ.fragment([(3, outer_box)], [stator1[0][0], rotor1[0][0], coil1, coil2])
-
+parts, parts_map = gmsh.model.occ.fragment(
+    [(3, outer_box)],
+    [stator1[0][0], rotor1[0][0], coil1, coil2],
+)
 
 gmsh.model.occ.synchronize()
 gmsh.model.occ.removeAllDuplicates()
 
-cell_entities = gmsh.model.getEntities(3)
-
 # # Iterate through each tuple in the list, and generate tags starting from 1
+# cell_entities = gmsh.model.getEntities(3)
 # for i, entity in enumerate(cell_entities, start=1):
 #     tag = i
 #     gmsh.model.addPhysicalGroup(3, [entity[1]], tag=tag)
 
-#%
-gmsh.model.addPhysicalGroup(3, [1], tag= domain_tags["coil1"])
-gmsh.model.addPhysicalGroup(3, [2], tag = domain_tags["coil2"])
-gmsh.model.addPhysicalGroup(3, [3], tag = domain_tags["rotor"])
-gmsh.model.addPhysicalGroup(3, [4], tag = domain_tags["stator"])
-gmsh.model.addPhysicalGroup(3, [5], tag = domain_tags["air"])
+air_entities    = [e[1] for e in parts_map[0]][0]  # outer_box remainder — may be >1 piece!
+stator_entities = [e[1] for e in parts_map[1]]
+rotor_entities  = [e[1] for e in parts_map[2]]
+coil1_entities  = [e[1] for e in parts_map[3]]
+coil2_entities  = [e[1] for e in parts_map[4]]
 
-facet_entities = gmsh.model.getEntities(2)
+gmsh.model.addPhysicalGroup(3, [air_entities],    tag=domain_tags["air"])
+gmsh.model.addPhysicalGroup(3, stator_entities, tag=domain_tags["stator"])
+gmsh.model.addPhysicalGroup(3, rotor_entities,  tag=domain_tags["rotor"])
+gmsh.model.addPhysicalGroup(3, coil1_entities,  tag=domain_tags["coil1"])
+gmsh.model.addPhysicalGroup(3, coil2_entities,  tag=domain_tags["coil2"])
 
 # # Iterate over each facet entity
+# facet_entities = gmsh.model.getEntities(2)
 # for entity in facet_entities:
 #     dim, tag = entity  # Extract the dimension and tag of the entity
 #     gmsh.model.addPhysicalGroup(dim, [tag], tag=tag)  # Use the tag as the physical group tag
-
-
-# surfaces_of_5 = gmsh.model.getBoundary([(3, 5)], oriented=False, combined=False)
-# surface_tags_of_5 = set(abs(s[1]) for s in surfaces_of_5)
-
-# all_3d = gmsh.model.getEntities(3)
-# other_entities = [(dim, tag) for dim, tag in all_3d if tag != 5]
-
-# shared_surfaces = set()
-# for entity in other_entities:
-#     bnd = gmsh.model.getBoundary([entity], oriented=False, combined=False)
-#     for s in bnd:
-#         shared_surfaces.add(abs(s[1]))
-
-# # Surfaces on (3,5) that are NOT shared with any other entity
-# exclusive_surfaces = surface_tags_of_5 - shared_surfaces
-# print("Exclusive boundary surfaces of entity 5:", exclusive_surfaces)
-
 
 boundary_surfaces_stator = gmsh.model.getBoundary([(3, 4)], oriented=False, combined=False)
 stator_tags = []
@@ -219,8 +209,6 @@ boundary_surfaces_rotor = gmsh.model.getBoundary([(3, 3)], oriented=False, combi
 rotor_tags = []
 for i, j in boundary_surfaces_rotor:
     rotor_tags.append(j)
-    
-#%%
 
 gmsh.model.addPhysicalGroup(2, [4], tag= boundary_tags["coil1_out"])
 gmsh.model.addPhysicalGroup(2, [10], tag= boundary_tags["coil1_in"])
@@ -232,7 +220,50 @@ gmsh.model.addPhysicalGroup(2, [57], tag= boundary_tags["symmetry"])
 gmsh.model.addPhysicalGroup(2, [55, 56, 58, 59, 60], tag= boundary_tags["outer"])
 
 
-gmsh.model.mesh.setSize(gmsh.model.getEntities(0), 5)
+# gmsh.model.mesh.setSize(gmsh.model.getEntities(0), 5)
+
+# ── Global background size (coarse everywhere first) ──────────────────────
+gmsh.model.mesh.setSize(gmsh.model.getEntities(0), 10)
+
+# ── Collect bounding curves/surfaces of the regions you care about ────────
+def get_boundary_curves(vol_tag):
+    """Return all curve tags on the boundary of a volume."""
+    surfs = gmsh.model.getBoundary([(3, vol_tag)], oriented=False)
+    curves = []
+    for s in surfs:
+        curves += [c for _, c in gmsh.model.getBoundary([s], oriented=False)]
+    return list(set(curves))
+
+coil1_curves  = get_boundary_curves(coil1_entities[0])
+coil2_curves  = get_boundary_curves(coil2_entities[0])
+stator_curves = [c for vol in stator_entities for c in get_boundary_curves(vol)]
+rotor_curves  = [c for vol in rotor_entities  for c in get_boundary_curves(vol)]
+
+all_refined_curves = list(set(coil1_curves + coil2_curves + stator_curves + rotor_curves))
+
+# ── Field 1: distance from the refined-region edges ───────────────────────
+gmsh.model.mesh.field.add("Distance", 1)
+gmsh.model.mesh.field.setNumbers(1, "CurvesList", all_refined_curves)
+gmsh.model.mesh.field.setNumber(1, "Sampling", 100)
+
+# ── Field 2: threshold — fine close in, coarse far out ────────────────────
+gmsh.model.mesh.field.add("Threshold", 2)
+gmsh.model.mesh.field.setNumber(2, "InField",   1)
+gmsh.model.mesh.field.setNumber(2, "SizeMin",   1.5)   # fine size at the surfaces
+gmsh.model.mesh.field.setNumber(2, "SizeMax",   10.0)  # coarse size in bulk air
+gmsh.model.mesh.field.setNumber(2, "DistMin",   3.0)   # stay fine within 3 mm
+gmsh.model.mesh.field.setNumber(2, "DistMax",   20.0)  # fully coarse beyond 20 mm
+
+# ── Apply as the background field ─────────────────────────────────────────
+gmsh.model.mesh.field.setAsBackgroundMesh(2)
+
+# Prevent gmsh from overriding the field with CAD-based sizes
+gmsh.option.setNumber("Mesh.MeshSizeFromPoints",    0)
+gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+
+gmsh.model.mesh.generate(3)
+
 
 
 gmsh.model.mesh.generate(3)
@@ -253,4 +284,3 @@ with XDMFFile(mesh.comm, "team24_horseshoe.xdmf", "w") as xdmf:
 
 print("Done. Mesh written to team24_horseshoe.xdmf")
 
-# %%
