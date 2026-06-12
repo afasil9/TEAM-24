@@ -1,7 +1,6 @@
 #%%
 from mpi4py import MPI
 from dolfinx import fem
-from dolfinx.mesh import meshtags
 from dolfinx.fem import (
     Function,
     form,
@@ -26,6 +25,9 @@ from utils import interpolate_by_tags
 from dolfinx import default_scalar_type
 from dolfinx.io import VTXWriter
 from dolfinx.fem import assemble_scalar
+import json
+import ctypes, subprocess,os
+
 
 comm = MPI.COMM_WORLD
 degree = 1
@@ -38,6 +40,7 @@ with XDMFFile(comm, "team24_horseshoe.xdmf", "r") as xdmf:
     mesh.topology.create_entities(fdim)
     ft   = xdmf.read_meshtags(mesh, name="Facet_markers")
 
+par_print(comm, f"Number of cells in the mesh: {mesh.topology.index_map(tdim).size_global}")
 
 ti = 0.0  # Start time
 T = 0.1  # End time
@@ -46,7 +49,7 @@ frequency = 50.0
 steps_per_period = 100
 d_t = 1.0 / (frequency * steps_per_period)
 
-n_cycles_warmup = 10
+n_cycles_warmup = 20
 n_cycles_measure = 1
 num_steps = int((n_cycles_warmup + n_cycles_measure) / (frequency * d_t))
 
@@ -117,7 +120,6 @@ interpolate_by_tags(sigma, sigma_values, ct)
 interpolate_by_tags(nu, nu_values, ct)
 
 
-#%%
 target_tags = [domains["coil1"], domains["coil2"], domains["rotor"], domains["stator"]]
 cell_lists = [ct.find(tag) for tag in target_tags]
 conductive_cells = np.unique(np.concatenate(cell_lists)).astype(np.int32)
@@ -138,14 +140,6 @@ V1 = fem.functionspace(submesh_conductive, lagrange_elem)
 omega = 2.0 * np.pi * frequency
 V_in = 10.0
 
-high_expr = fem.Expression(
-    V_in * ufl.sin(omega * t), V1.element.interpolation_points
-)
-
-high_expr_minus = fem.Expression(
-    -V_in * ufl.sin(omega * t), V1.element.interpolation_points
-)
-
 
 outer_boundaries = [boundary["outer"], boundary["symmetry"], boundary["coil1_out"], boundary["coil2_out"], boundary["coil1_in"], boundary["coil2_in"]]
 outer_boundary_tags = np.unique(np.concatenate([ft.find(tag) for tag in outer_boundaries]))
@@ -162,6 +156,9 @@ coil1_in = conductive_ft.find(boundary["coil1_in"])
 bdofs_coil1_in = fem.locate_dofs_topological(V1, entity_dim=fdim, entities=coil1_in)
 coil1_in_func = fem.Function(V1)
 # coil1_in_func.x.array[:] = 1.0
+high_expr = fem.Expression(
+    V_in * ufl.sin(omega * t), V1.element.interpolation_points
+)
 coil1_in_func.interpolate(high_expr)
 bc2 = fem.dirichletbc(coil1_in_func, bdofs_coil1_in)
 
@@ -175,7 +172,10 @@ coil2_in = conductive_ft.find(boundary["coil2_in"])
 bdofs_coil2_in = fem.locate_dofs_topological(V1, entity_dim=fdim, entities=coil2_in)
 coil2_in_func = fem.Function(V1)
 # coil2_in_func.x.array[:] = -1.0
-coil2_in_func.interpolate(high_expr_minus)
+low_expr = fem.Expression(
+    -V_in * ufl.sin(omega * t), V1.element.interpolation_points
+)
+coil2_in_func.interpolate(low_expr)
 bc4 = fem.dirichletbc(coil2_in_func, bdofs_coil2_in)
 
 coil2_out = conductive_ft.find(boundary["coil2_out"])
@@ -254,12 +254,12 @@ is_u1 = PETSc.IS().createStride(u1_map.size_local, offset_u1, 1, comm=mesh.comm)
 
 ksp = PETSc.KSP().create(mesh.comm)
 ksp.setOperators(A_mat, P)
-ksp.setType("fgmres")
-ksp.setGMRESRestart(100)
-ksp.setTolerances(rtol=1e-12, atol=1e-8, max_it=100)
+ksp.setType("gmres")
+ksp.setGMRESRestart(200)
+ksp.setTolerances(rtol=1e-8, atol=1e-8, max_it=200)
 ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
 ksp.getPC().setType("fieldsplit")
-ksp.getPC().setFieldSplitType(PETSc.PC.CompositeType.MULTIPLICATIVE)
+ksp.getPC().setFieldSplitType(PETSc.PC.CompositeType.ADDITIVE)
 ksp.getPC().setFieldSplitIS(("u", is_u), ("u1", is_u1))
 ksp_u, ksp_u1 = ksp.getPC().getFieldSplitSubKSP()
 
@@ -306,10 +306,10 @@ else:
 ksp.setOptionsPrefix("main_") # Add this line
 
 opts = PETSc.Options()
-opts[f"{ksp.getOptionsPrefix()}ksp_monitor_true_residual"] = None
+# opts[f"{ksp.getOptionsPrefix()}ksp_monitor_true_residual"] = None
 opts[f"{ksp_u.prefix}pc_hypre_ams_cycle_type"] = 1
 opts[f"{ksp_u.prefix}pc_hypre_ams_tol"] = 0
-opts[f"{ksp_u.prefix}pc_hypre_ams_max_iter"] = 1
+opts[f"{ksp_u.prefix}pc_hypre_ams_max_iter"] = 4
 opts[f"{ksp_u.prefix}pc_hypre_ams_amg_beta_theta"] = 0.25
 opts[f"{ksp_u.prefix}pc_hypre_ams_print_level"] = 0
 opts[f"{ksp_u.prefix}pc_hypre_ams_amg_alpha_options"] = "10,2,6,6,6"
@@ -410,14 +410,6 @@ dt_submesh = fem.Constant(submesh_conductive, d_t)
 da_dt_submesh = (u_n_submesh - u_n_submesh_prev) / dt_submesh
 
 
-da_dt_vis = fem.Function(DG_submesh_vis)
-da_dt_expr = fem.Expression(da_dt_submesh, DG_submesh_vis.element.interpolation_points)
-da_dt_vis.interpolate(da_dt_expr)
-da_dt_file = VTXWriter(mesh.comm, "da_dt_submesh.bp", da_dt_vis, "BP4")
-da_dt_file.write(t)
-
-
-
 # B on submesh
 B_vis_submesh = fem.Function(DG_submesh_vis)
 B_vis_submesh.interpolate(
@@ -427,12 +419,6 @@ B_file_submesh = VTXWriter(mesh.comm, "B_submesh.bp", B_vis_submesh, "BP4")
 B_file_submesh.write(t)
 
 E = -grad(u_n1) - da_dt_submesh
-# E_vis = Function(DG_submesh_vis)
-# Eexpr = fem.Expression(E, DG_submesh_vis.element.interpolation_points)
-# E_vis.interpolate(E_expr)
-# E_vis.x.scatter_forward()
-# E_file = VTXWriter(mesh.comm, "E_field.bp", E_vis, "BP4")
-# E_file.write(t)
 
 
 DG_0_submesh_vis = fem.functionspace(submesh_conductive, ("DG", 0))
@@ -449,44 +435,24 @@ J_file = VTXWriter(mesh.comm, "J_field.bp", J_vis, "BP4")
 J_file.write(t)
 
 
+last_steps = 50
 
-# Find stator cells in the parent mesh
-stator_cells_parent = ct.find(domains["stator"])  # tag 5
-all_smsh_cells = np.arange(smsh_cell_imap.size_local + smsh_cell_imap.num_ghosts)
-all_parent_cells = subdomain_conductive_to_domain.sub_topology_to_topology(all_smsh_cells, inverse=False)
+def gscalar(expr, entity_maps=None):
+    return comm.allreduce(assemble_scalar(form(expr, entity_maps=entity_maps)), op=MPI.SUM)
+dx_c = dx(tuple(target_tags))
 
-# Find which submesh cells correspond to stator (tag 5)
-stator_mask = np.isin(all_parent_cells, stator_cells_parent)
-stator_smsh_cells = all_smsh_cells[stator_mask].astype(np.int32)
-
-# Build a meshtag on the submesh for tag 5
-submesh_ct_stator = meshtags(
-    submesh_conductive, tdim, stator_smsh_cells,
-    np.full(len(stator_smsh_cells), domains["stator"], dtype=np.int32)
-)
-
-# Measure restricted to stator on submesh
-dx_stator = ufl.Measure("dx", domain=submesh_conductive, subdomain_data=submesh_ct_stator)
-
-# L2 norm of da_dt_submesh on stator cells only
-da_dt_stator_norm = np.sqrt(
-    MPI.COMM_WORLD.allreduce(
-        assemble_scalar(form(inner(da_dt_submesh, da_dt_submesh) * dx_stator(domains["stator"]))),
-        op=MPI.SUM
-    )
-)
-par_print(mesh.comm, f"L2 norm of da_dt on stator (tag 5): {da_dt_stator_norm}")
-
-last_steps = 1
+diagnostics = []
+diag_path = "diagnostics_av_mixed.json"
 
 
-
-for n in range(1):
-
-    par_print(comm, "\n")
+num_steps = 10
+for n in range(num_steps):
 
     t.value += d_t
+
+    par_print(comm, "\n")
     par_print(comm, f"Time step {n+1}: t = {t.value}")
+
     ksp_u.getPC().HYPREAMSResetSolveCounter()
 
     u_n_prev.x.array[:] = u_n.x.array[:]
@@ -498,12 +464,13 @@ for n in range(1):
     high_expr = fem.Expression(
     V_in * ufl.sin(omega * t), V1.element.interpolation_points)
 
-    high_expr_minus = fem.Expression(
-        -V_in * ufl.sin(omega * t), V1.element.interpolation_points
+    low_expr = fem.Expression(
+    -V_in * ufl.sin(omega * t), V1.element.interpolation_points
     )
 
     coil1_in_func.interpolate(high_expr)
-    coil2_in_func.interpolate(high_expr_minus)
+    coil2_in_func.interpolate(low_expr)
+
 
     bcs = [bc1, bc2, bc3, bc4, bc5]
 
@@ -515,11 +482,6 @@ for n in range(1):
     set_bc(b, bcs0)
 
     sol = A_mat.createVecRight()
-
-
-    par_print(comm, f"A_mat norm: {A_mat.norm()}")
-    par_print(comm, f"no of dofs in u: {V.dofmap.index_map.size_global}")
-    par_print(comm, f"norm of b: {b.norm()}")
 
     ksp.solve(b, sol)
 
@@ -536,40 +498,66 @@ for n in range(1):
     u_n1.x.scatter_forward()
 
     reason = ksp.getConvergedReason()
-    par_print(comm, f"Converged reason: {reason}")
-
-    res = ksp.getResidualNorm()
-    par_print(comm, f"Final residual: {res}")
+    rel_norm = ksp.getResidualNorm() / b.norm()
 
     u_n_submesh.interpolate(u_n, cells0=parent_cells, cells1=smsh_cells)
-
-    par_print(comm, f"L2 norm of u_n_submesh is {L2_norm(u_n_submesh)}")
-    par_print(comm, f"L2 norm of u_n_submesh_prev is {L2_norm(u_n_submesh_prev)}")
-    par_print(comm, f"L2 norm of da_dt_submesh is {L2_norm(da_dt_submesh)}")
 
 
     B = curl(u_n)
     u_n_submesh.interpolate(u_n, cells0=parent_cells, cells1=smsh_cells)
-    da_dt_submesh = (u_n_submesh - u_n_submesh_prev) / dt_submesh
-    E = -grad(u_n1) - da_dt_submesh
+    da_dt_submesh = -(u_n_submesh - u_n_submesh_prev) / dt_submesh
+    E_gal = -grad(u_n1)
+    
+    E = E_gal + da_dt_submesh
     J_ind = sigma_submesh * E
 
 
-    da_dt_stator_norm = np.sqrt(
-    MPI.COMM_WORLD.allreduce(
-        assemble_scalar(form(inner(da_dt_submesh, da_dt_submesh) * dx_stator(domains["stator"]))),
-        op=MPI.SUM
-    )
-    )
-    par_print(mesh.comm, f"L2 norm of da_dt on stator (tag 5): {da_dt_stator_norm}")
+    # par_print(comm, f"Converged reason: {reason}")
 
+    # par_print(comm, f"L2 norm of u_n is {L2_norm(u_n)}")
     # par_print(comm, f"L2 norm of B is {L2_norm(B)}")
+    # par_print(comm, f"L2 norm of u_n1 is {L2_norm(u_n1)}")
+    # par_print(comm, f"L2 norm of E_gal is {L2_norm(E_gal)}")
+    # par_print(comm, f"L2 norm of da_dt is {L2_norm(da_dt_submesh)}")
     # par_print(comm, f"L2 norm of E is {L2_norm(E)}")
-    # par_print(comm, f"L2 norm of J is {L2_norm(J_ind)}")
+    # par_print(comm, f"L2 norm of J is {L2_norm(J)}")
 
+    # par_print(comm, f"L2 norm of sigma*grad(phi) = {L2_norm(sigma_submesh*E_gal)}")
+    # par_print(comm, f"L2 norm of sigma*dA_dt = {L2_norm(sigma_submesh*da_dt_submesh)}")
 
-    # if n >= num_steps - last_steps:
-    if n >0:
+    W_mag   = 0.5 * gscalar(nu * inner(B, B) * dx)
+    P_joule = gscalar(sigma_submesh * inner(E, E) * dx_c, entity_maps=entity_maps)
+    P_eddy  = gscalar(sigma_submesh * inner(da_dt_submesh, da_dt_submesh) * dx_c, entity_maps=entity_maps)   # ∫σ|∂A/∂t|²
+    P_cond  = gscalar(sigma_submesh * inner(E_gal, E_gal) * dx_c, entity_maps=entity_maps)   # ∫σ|∇V|²
+
+    record = {
+        "step": n + 1,
+        "t": float(t.value),
+        "ksp_reason": reason,
+        "ksp_rel_residual": rel_norm,
+        "Iterations": ksp.getIterationNumber(),
+        "W_mag": W_mag,
+        "P_joule": P_joule,
+        "P_eddy": P_eddy,
+        "P_cond": P_cond,
+        "L2_u_n": L2_norm(u_n),
+        "L2_u_n1": L2_norm(u_n1),
+        "L2_B": L2_norm(B),
+        "L2_E": L2_norm(E),
+        "L2_J": L2_norm(J),
+        "L2_E_gal": L2_norm(E_gal),
+        "L2_da_dt": L2_norm(da_dt_submesh),
+        "L2_delta_A": L2_norm(u_n - u_n_prev),
+        "L2_delta_B": L2_norm(curl(u_n) - curl(u_n_prev)),
+    }
+
+    diagnostics.append(record)
+
+    with open(diag_path, "w") as diag_file:
+        json.dump(diagnostics, diag_file, indent=4)
+
+    if n >= num_steps - last_steps:
+    # if n >0:
         par_print(comm, "Writing output files...")
         
         Bexpr = fem.Expression(B, vector_vis.element.interpolation_points)
@@ -578,14 +566,6 @@ for n in range(1):
 
         B_vis_submesh.interpolate(B_vis, cells0=parent_cells, cells1=smsh_cells)
         B_file_submesh.write(t)
-
-        # Eexpr = fem.Expression(E, vector_vis.element.interpolation_points)
-        # E_vis.interpolate(Eexpr)
-        # E_file.write(t.value)
-
-        da_dt_expr = fem.Expression(da_dt_submesh, DG_submesh_vis.element.interpolation_points)
-        da_dt_vis.interpolate(da_dt_expr)
-        da_dt_file.write(t)
 
         Jexpr = fem.Expression(J_ind, vector_vis.element.interpolation_points)
         J_vis.interpolate(Jexpr)
