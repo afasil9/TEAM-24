@@ -27,19 +27,26 @@ from dolfinx.io import VTXWriter
 from dolfinx.fem import assemble_scalar
 import json
 from dolfinx.fem.petsc import assemble_matrix, assemble_vector, apply_lifting, set_bc, LinearProblem
+from dolfinx.common import Timer, list_timings
+from dolfinx.mesh import refine, transfer_meshtag
+from dolfinx.cpp.refinement import RefinementOption
+from dolfinx.mesh import GhostMode
+
 
 comm = MPI.COMM_WORLD
 degree = 1
 
+from dolfinx.mesh import GhostMode, refine, transfer_meshtag
+from dolfinx.cpp.refinement import RefinementOption
+
 with XDMFFile(comm, "team24_horseshoe.xdmf", "r") as xdmf:
     mesh = xdmf.read_mesh()
-    ct   = xdmf.read_meshtags(mesh, name="Cell_markers")
     tdim = mesh.topology.dim
     fdim = tdim - 1
     mesh.topology.create_entities(fdim)
-    ft   = xdmf.read_meshtags(mesh, name="Facet_markers")
+    ct = xdmf.read_meshtags(mesh, name="Cell_markers")
+    ft = xdmf.read_meshtags(mesh, name="Facet_markers")
 
-par_print(comm, f"Number of cells in the mesh: {mesh.topology.index_map(tdim).size_global}")
 
 ti = 0.0  # Start time
 T = 0.1  # End time
@@ -48,7 +55,7 @@ frequency = 50.0
 steps_per_period = 100
 d_t = 1.0 / (frequency * steps_per_period)
 
-n_cycles_warmup = 10
+n_cycles_warmup = 5
 n_cycles_measure = 1
 num_steps = int((n_cycles_warmup + n_cycles_measure) / (frequency * d_t))
 
@@ -137,7 +144,7 @@ V1 = fem.functionspace(submesh_conductive, lagrange_elem)
 # Boundary conditions
 
 omega = 2.0 * np.pi * frequency
-V_in = 10.0
+V_in = 1.0
 
 
 outer_boundaries = [boundary["outer"], boundary["symmetry"], boundary["coil1_out"], boundary["coil2_out"], boundary["coil1_in"], boundary["coil2_in"]]
@@ -226,8 +233,9 @@ L = form([L0, L1], entity_maps=entity_maps)
 
 # Solver steps
 
-A_mat = assemble_matrix(a, bcs=bcs)
-A_mat.assemble()
+with Timer("Setup: Assembling system") as timer:
+    A_mat = assemble_matrix(a, bcs=bcs)
+    A_mat.assemble()
 
 b = assemble_vector(L)
 bcs1 = bcs_by_block(extract_function_spaces(a, 1), bcs)
@@ -235,10 +243,6 @@ apply_lifting(b, a, bcs=bcs1)
 b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
 bcs0 = bcs_by_block(extract_function_spaces(L), bcs)
 set_bc(b, bcs0)
-
-a_p = form([[a00, None], [None, a11]], entity_maps=entity_maps)
-P = assemble_matrix(a_p, bcs=bcs)
-P.assemble()
 
 u_map = V.dofmap.index_map
 u1_map = V1.dofmap.index_map
@@ -251,114 +255,119 @@ is_u = PETSc.IS().createStride(
 )
 is_u1 = PETSc.IS().createStride(u1_map.size_local, offset_u1, 1, comm=mesh.comm)
 
-ksp = PETSc.KSP().create(mesh.comm)
-ksp.setOperators(A_mat, P)
-ksp.setType("gmres")
-ksp.setGMRESRestart(200)
-ksp.setTolerances(rtol=1e-7, atol=1e-7, max_it=200)
-ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
-ksp.getPC().setType("fieldsplit")
-ksp.getPC().setFieldSplitType(PETSc.PC.CompositeType.ADDITIVE)
-ksp.getPC().setFieldSplitIS(("u", is_u), ("u1", is_u1))
-ksp_u, ksp_u1 = ksp.getPC().getFieldSplitSubKSP()
 
-ksp_u.setType("preonly")
-ksp_u.getPC().setType("hypre")
-ksp_u.getPC().setHYPREType("ams")
+with Timer("Setup: Assembling Preconditioner") as timer:
+    a_p = form([[a00, None], [None, a11]], entity_maps=entity_maps)
+    P = assemble_matrix(a_p, bcs=bcs)
+    P.assemble()
 
-W = fem.functionspace(mesh, ("Lagrange", degree))
-G = discrete_gradient(W._cpp_object, V._cpp_object)
-G.assemble()
-ksp_u.getPC().setHYPREDiscreteGradient(G)
+    ksp = PETSc.KSP().create(mesh.comm)
+    ksp.setOperators(A_mat, P)
+    ksp.setType("gmres")
+    ksp.setGMRESRestart(200)
+    ksp.setTolerances(rtol=1e-7, atol=1e-7, max_it=1)
+    ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
+    ksp.getPC().setType("fieldsplit")
+    ksp.getPC().setFieldSplitType(PETSc.PC.CompositeType.ADDITIVE)
+    ksp.getPC().setFieldSplitIS(("u", is_u), ("u1", is_u1))
+    ksp_u, ksp_u1 = ksp.getPC().getFieldSplitSubKSP()
 
-if degree == 1:
-    cvec_0 = Function(V)
-    cvec_0.interpolate(
-        lambda x: np.vstack(
-            (np.ones_like(x[0]), np.zeros_like(x[0]), np.zeros_like(x[0]))
+    ksp_u.setType("preonly")
+    ksp_u.getPC().setType("hypre")
+    ksp_u.getPC().setHYPREType("ams")
+
+    W = fem.functionspace(mesh, ("Lagrange", degree))
+    G = discrete_gradient(W._cpp_object, V._cpp_object)
+    G.assemble()
+    ksp_u.getPC().setHYPREDiscreteGradient(G)
+
+    if degree == 1:
+        cvec_0 = Function(V)
+        cvec_0.interpolate(
+            lambda x: np.vstack(
+                (np.ones_like(x[0]), np.zeros_like(x[0]), np.zeros_like(x[0]))
+            )
         )
-    )
-    cvec_1 = Function(V)
-    cvec_1.interpolate(
-        lambda x: np.vstack(
-            (np.zeros_like(x[0]), np.ones_like(x[0]), np.zeros_like(x[0]))
+        cvec_1 = Function(V)
+        cvec_1.interpolate(
+            lambda x: np.vstack(
+                (np.zeros_like(x[0]), np.ones_like(x[0]), np.zeros_like(x[0]))
+            )
         )
-    )
-    cvec_2 = Function(V)
-    cvec_2.interpolate(
-        lambda x: np.vstack(
-            (np.zeros_like(x[0]), np.zeros_like(x[0]), np.ones_like(x[0]))
+        cvec_2 = Function(V)
+        cvec_2.interpolate(
+            lambda x: np.vstack(
+                (np.zeros_like(x[0]), np.zeros_like(x[0]), np.ones_like(x[0]))
+            )
         )
-    )
-    ksp_u.getPC().setHYPRESetEdgeConstantVectors(
-        cvec_0.x.petsc_vec, cvec_1.x.petsc_vec, cvec_2.x.petsc_vec
-    )
+        ksp_u.getPC().setHYPRESetEdgeConstantVectors(
+            cvec_0.x.petsc_vec, cvec_1.x.petsc_vec, cvec_2.x.petsc_vec
+        )
 
-else:
-    shape = (mesh.geometry.dim,)
-    Q = fem.functionspace(mesh, ("Lagrange", degree, shape))
-    Pi = interpolation_matrix(Q._cpp_object, V._cpp_object)
-    Pi.assemble()
-    ksp_u.getPC().setHYPRESetInterpolations(dim=mesh.geometry.dim, ND_Pi_Full=Pi)
+    else:
+        shape = (mesh.geometry.dim,)
+        Q = fem.functionspace(mesh, ("Lagrange", degree, shape))
+        Pi = interpolation_matrix(Q._cpp_object, V._cpp_object)
+        Pi.assemble()
+        ksp_u.getPC().setHYPRESetInterpolations(dim=mesh.geometry.dim, ND_Pi_Full=Pi)
 
 
-ksp.setOptionsPrefix("main_") # Add this line
+    ksp.setOptionsPrefix("main_") # Add this line
 
-opts = PETSc.Options()
-# opts[f"{ksp.getOptionsPrefix()}ksp_monitor_true_residual"] = None
-opts[f"{ksp_u.prefix}pc_hypre_ams_cycle_type"] = 1
-opts[f"{ksp_u.prefix}pc_hypre_ams_tol"] = 0
-opts[f"{ksp_u.prefix}pc_hypre_ams_max_iter"] = 4
-opts[f"{ksp_u.prefix}pc_hypre_ams_amg_beta_theta"] = 0.25
-opts[f"{ksp_u.prefix}pc_hypre_ams_print_level"] = 0
-opts[f"{ksp_u.prefix}pc_hypre_ams_amg_alpha_options"] = "10,2,6,6,6"
-opts[f"{ksp_u.prefix}pc_hypre_ams_amg_beta_options"] = "10,1,6,6,4"
-opts[f"{ksp_u.prefix}pc_hypre_ams_relax_type"] = 8
-opts[f"{ksp_u.prefix}pc_hypre_ams_relax_weight"] = 1.0
-opts[f"{ksp_u.prefix}pc_hypre_ams_relax_times"] = 2
-opts[f"{ksp_u.prefix}pc_hypre_ams_omega"] = 1.0
-opts[f"{ksp_u.prefix}pc_hypre_ams_projection_frequency"] = 100000000
+    opts = PETSc.Options()
+    # opts[f"{ksp.getOptionsPrefix()}ksp_monitor_true_residual"] = None
+    opts[f"{ksp_u.prefix}pc_hypre_ams_cycle_type"] = 1
+    opts[f"{ksp_u.prefix}pc_hypre_ams_tol"] = 0
+    opts[f"{ksp_u.prefix}pc_hypre_ams_max_iter"] = 4
+    opts[f"{ksp_u.prefix}pc_hypre_ams_amg_beta_theta"] = 0.25
+    opts[f"{ksp_u.prefix}pc_hypre_ams_print_level"] = 0
+    opts[f"{ksp_u.prefix}pc_hypre_ams_amg_alpha_options"] = "10,2,6,6,6"
+    opts[f"{ksp_u.prefix}pc_hypre_ams_amg_beta_options"] = "10,1,6,6,4"
+    opts[f"{ksp_u.prefix}pc_hypre_ams_relax_type"] = 8
+    opts[f"{ksp_u.prefix}pc_hypre_ams_relax_weight"] = 1.0
+    opts[f"{ksp_u.prefix}pc_hypre_ams_relax_times"] = 2
+    opts[f"{ksp_u.prefix}pc_hypre_ams_omega"] = 1.0
+    opts[f"{ksp_u.prefix}pc_hypre_ams_projection_frequency"] = 100000000
 
-V_interior = fem.functionspace(mesh, ("CG", degree))
-interior_nodes_array = fem.Function(V_interior)
+    V_interior = fem.functionspace(mesh, ("CG", degree))
+    interior_nodes_array = fem.Function(V_interior)
 
-interior_nodes_array.x.array[:] = 1.0
-interior_nodes_array.x.scatter_forward()
+    interior_nodes_array.x.array[:] = 1.0
+    interior_nodes_array.x.scatter_forward()
 
-dofmap = W.dofmap
-num_dofs_per_cell = dofmap.dof_layout.num_dofs
-cell_dofs = dofmap.list.reshape(-1, num_dofs_per_cell)
+    dofmap = W.dofmap
+    num_dofs_per_cell = dofmap.dof_layout.num_dofs
+    cell_dofs = dofmap.list.reshape(-1, num_dofs_per_cell)
 
-tags = omega_c
-tagged_cells = np.unique(np.concatenate([ct.find(tag) for tag in tags]))
+    tags = omega_c
+    tagged_cells = np.unique(np.concatenate([ct.find(tag) for tag in tags]))
 
-tagged_cell_dofs = cell_dofs[tagged_cells].flatten()
-unique_dofs = np.unique(tagged_cell_dofs)
+    tagged_cell_dofs = cell_dofs[tagged_cells].flatten()
+    unique_dofs = np.unique(tagged_cell_dofs)
 
-interior_nodes_array.x.array[unique_dofs] = 0.0
-interior_nodes_array.x.scatter_forward()
+    interior_nodes_array.x.array[unique_dofs] = 0.0
+    interior_nodes_array.x.scatter_forward()
 
-ksp_u.getPC().setHYPREAMSSetInteriorNodes(interior_nodes_array.x.petsc_vec)
+    ksp_u.getPC().setHYPREAMSSetInteriorNodes(interior_nodes_array.x.petsc_vec)
 
-ksp_u.setFromOptions()
+    ksp_u.setFromOptions()
 
-ksp_u1.setType("preonly")
-ksp_u1.getPC().setType("hypre")
-ksp_u1.getPC().setHYPREType("boomeramg")
+    ksp_u1.setType("preonly")
+    ksp_u1.getPC().setType("hypre")
+    ksp_u1.getPC().setHYPREType("boomeramg")
 
-ksp_u1.setFromOptions()
+    ksp_u1.setFromOptions()
 
-ksp.setFromOptions()
-ksp.setUp()
-ksp_u.getPC().setUp()
-ksp_u1.getPC().setUp()
+    ksp.setFromOptions()
+    ksp.setUp()
+    ksp_u.getPC().setUp()
+    ksp_u1.getPC().setUp()
 
 sol = A_mat.createVecRight()
 
-
-par_print(mesh.comm, "about to solve")
-ksp.solve(b, sol)
-
+with Timer("Initial solve") as timer:
+    par_print(mesh.comm, "about to solve")
+    ksp.solve(b, sol)
 
 reason = ksp.getConvergedReason()
 par_print(mesh.comm, f"KSP converged with reason {reason}")
@@ -549,13 +558,16 @@ def solve_thermal(Q_expr, theta_n):
 
     return theta_n
 
-
 #%%
 last_steps = 100
 
 def gscalar(expr, entity_maps=None):
     return comm.allreduce(assemble_scalar(form(expr, entity_maps=entity_maps)), op=MPI.SUM)
 dx_c = dx(tuple(target_tags))
+
+solve_times_EM = []
+solve_iters_EM = []
+solve_times_thermal = []
 
 for n in range(num_steps):
 
@@ -594,7 +606,12 @@ for n in range(num_steps):
 
     sol = A_mat.createVecRight()
 
-    ksp.solve(b, sol)
+    with timer("EM Solve"):
+        ksp.solve(b, sol)
+    elapsed = timer.elapsed()        # this step's solve time
+
+    solve_times_EM.append(elapsed)
+    solve_iters_EM.append(ksp.getIterationNumber())
 
     uh.x.array[:offset] = sol.array_r[:offset]
     uh1.x.array[:(len(sol.array_r) - offset)] = sol.array_r[offset:]
@@ -613,7 +630,6 @@ for n in range(num_steps):
 
     u_n_submesh.interpolate(u_n, cells0=parent_cells, cells1=smsh_cells)
 
-
     B = curl(u_n)
     u_n_submesh.interpolate(u_n, cells0=parent_cells, cells1=smsh_cells)
     da_dt_submesh = -(u_n_submesh - u_n_submesh_prev) / dt_submesh
@@ -623,8 +639,11 @@ for n in range(num_steps):
     J_ind = sigma_submesh * E
 
     Q = sigma_submesh * ufl.dot(ufl.grad(u_n1), ufl.grad(u_n1))
-    theta_n = solve_thermal(Q, theta_n)
 
+    with Timer("Solving thermal problem") as timer:
+        theta_n = solve_thermal(Q, theta_n)
+    elapsed_thermal = timer.elapsed()
+    solve_times_thermal.append(elapsed_thermal)
 
     # par_print(comm, f"Converged reason: {reason}")
 
@@ -665,6 +684,8 @@ for n in range(num_steps):
         "L2_delta_B": L2_norm(curl(u_n) - curl(u_n_prev)),
         "L2_Q": L2_norm(Q),
         "L2_theta": L2_norm(theta_n),
+        "solve_time_EM": elapsed,
+        "solve_time_thermal": elapsed_thermal
     }
 
     diagnostics.append(record)
