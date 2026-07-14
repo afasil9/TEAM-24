@@ -51,8 +51,8 @@ V_rotor = fem.functionspace(submesh_rotor, ("DG", 0))
 q_rotor = fem.Function(V_rotor)
 q_rotor.x.array[:] = 1.0
 
-V_bg = fem.functionspace(mesh, ("DG", 0))
-q_bg = fem.Function(V_bg)
+V_background = fem.functionspace(mesh, ("DG", 0))
+q_bg = fem.Function(V_background)
 
 
 file = VTXWriter(mesh.comm, "rotor_geometry.bp", [q_bg], "BP4")
@@ -89,13 +89,31 @@ problem = LinearProblem(
     petsc_options_prefix="poisson_"
 )
 
+theta = 0.0
+
 u_file = VTXWriter(mesh.comm, "results.bp", [uh], "BP4")
+u_file.write(theta)
+
+Lagrange_rot = fem.functionspace(submesh_rotor, ("Lagrange", degree))
+
+smsh_cell_imap = submesh_rotor.topology.index_map(tdim)
+smsh_cells = np.arange(smsh_cell_imap.size_local + smsh_cell_imap.num_ghosts)
+parent_cells = rotor_to_parent.sub_topology_to_topology(smsh_cells, inverse=False)
+u_rotor = fem.Function(Lagrange_rot)
+u_rotor.interpolate(
+    uh,
+    cells0=parent_cells,
+    cells1=smsh_cells
+)
+
+u_file_rotor = VTXWriter(mesh.comm, "u_field_rotor.bp", u_rotor, "BP4")
+u_file_rotor.write(theta)
 
 
 for theta in angles:
     set_mesh_rotation(submesh_rotor, rotor_ref_coords, theta, centre)
 
-    idata = fem.create_interpolation_data(V_bg, V_rotor, combined_cells, padding=1e-14)
+    idata = fem.create_interpolation_data(V_background, V_rotor, combined_cells, padding=1e-14)
 
     q_bg.x.array[:] = 0.0
     q_bg.interpolate_nonmatching(q_rotor, combined_cells, interpolation_data=idata)
@@ -107,8 +125,16 @@ for theta in angles:
     uh.x.scatter_forward()
     u_file.write(theta)
 
+    u_rotor.interpolate(
+    uh,
+    cells0=parent_cells,
+    cells1=smsh_cells
+    )
+    u_file_rotor.write(theta)
+
     par_print(comm, f"|u|_L2 = {L2_norm(uh):.6e}")
 
 
 file.close()
 u_file.close()
+u_file_rotor.close()
