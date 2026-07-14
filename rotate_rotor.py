@@ -49,8 +49,8 @@ V_rotor = fem.functionspace(submesh_rotor, ("DG", 0))
 q_rotor = fem.Function(V_rotor)
 q_rotor.x.array[:] = 1.0
 
-V_bg = fem.functionspace(mesh, ("DG", 0))
-q_bg = fem.Function(V_bg)
+V_domain = fem.functionspace(mesh, ("DG", 0))
+q_bg = fem.Function(V_domain)
 
 file = VTXWriter(mesh.comm, "qbg.bp", [q_bg], "BP4")
 file.write(0.0)
@@ -63,10 +63,13 @@ angles = np.deg2rad(np.linspace(0.0, 180.0, 20, endpoint=False))
 
 
 for theta in angles:
+    # Rotate the rotor submesh to the new angle but background mesh is unchanged
     set_mesh_rotation(submesh_rotor, rotor_ref_coords, theta, centre)
 
-    idata = fem.create_interpolation_data(V_bg, V_rotor, combined_cells, padding=1e-14) # This interpolates between the 2 meshes
+    # Builds interpolation map to transfer a field from the rotor mesh to the background mesh.
+    idata = fem.create_interpolation_data(V_domain, V_rotor, combined_cells, padding=1e-14) # This interpolates between the 2 meshes
 
+    # Interpolate the rotor field to the background mesh and write it to file
     q_bg.x.array[:] = 0.0
     q_bg.interpolate_nonmatching(q_rotor, combined_cells, interpolation_data=idata)
     q_bg.x.scatter_forward()
