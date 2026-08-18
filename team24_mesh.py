@@ -131,6 +131,8 @@ boundary_tags = {
     "stator_outer": 8,
     "inlet": 9,
     "outlet": 10,
+    "coil1": 11,
+    "coil2": 12,
 }
 
 
@@ -212,6 +214,24 @@ rotor_tags = []
 for i, j in boundary_surfaces_rotor:
     rotor_tags.append(j)
 
+coil1_surfaces = gmsh.model.getBoundary(
+    [(3, v) for v in coil1_entities],
+    oriented=False,
+    combined=False,     # <- keep per-volume faces; True unions them
+    recursive=False,
+)
+coil1_surface_tags = [t for d, t in coil1_surfaces if d == 2]
+coil1_outer_tags = [tag for tag in coil1_surface_tags if tag not in [10, 4]]
+
+coil2_surfaces = gmsh.model.getBoundary(
+    [(3, v) for v in coil2_entities],
+    oriented=False,
+    combined=False,     # <- keep per-volume faces; True unions them
+    recursive=False,
+)
+coil2_surface_tags = [t for d, t in coil2_surfaces if d == 2]
+coil2_outer_tags = [tag for tag in coil2_surface_tags if tag not in [14, 22] and tag not in stator_tags and tag not in rotor_tags]
+
 gmsh.model.addPhysicalGroup(2, [4], tag= boundary_tags["coil1_out"])
 gmsh.model.addPhysicalGroup(2, [10], tag= boundary_tags["coil1_in"])
 gmsh.model.addPhysicalGroup(2, [14], tag= boundary_tags["coil2_in"])
@@ -220,7 +240,10 @@ gmsh.model.addPhysicalGroup(2, stator_tags, tag= boundary_tags["stator_outer"])
 gmsh.model.addPhysicalGroup(2, rotor_tags, tag= boundary_tags["rotor_outer"])
 gmsh.model.addPhysicalGroup(2, [57], tag= boundary_tags["symmetry"])
 gmsh.model.addPhysicalGroup(2, [56, 58, 59], tag= boundary_tags["outer"])
-
+gmsh.model.addPhysicalGroup(2, [55], tag= boundary_tags["inlet"])
+gmsh.model.addPhysicalGroup(2, [60], tag= boundary_tags["outlet"])
+gmsh.model.addPhysicalGroup(2, coil1_outer_tags, tag= boundary_tags["coil1"])
+gmsh.model.addPhysicalGroup(2, coil2_outer_tags, tag= boundary_tags["coil2"])
 
 gmsh.model.mesh.setSize(gmsh.model.getEntities(0), 10)  # global coarse
 
