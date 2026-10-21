@@ -2,7 +2,7 @@
 import ufl
 import numpy as np
 from basix.ufl import element
-from dolfinx import default_scalar_type, fem
+from dolfinx import default_scalar_type, fem, la
 from dolfinx.fem import Function, form
 from dolfinx.fem.petsc import (
     apply_lifting,
@@ -155,7 +155,7 @@ set_bc(b, bcs)
 ksp = PETSc.KSP().create(mesh.comm)
 ksp.setOptionsPrefix("main_")
 ksp.setOperators(A_mat)
-ksp.setType("fgmres")
+ksp.setType("cg")
 ksp.setGMRESRestart(100)
 ksp.setTolerances(rtol=1e-8, atol=1e-8, max_it=100)
 ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
@@ -202,12 +202,18 @@ else:
     pc.setHYPRESetInterpolations(dim=mesh.geometry.dim, ND_Pi_Full=Pi)
 
 omega_c = (domains["rotor"], domains["stator"])
-interior_nodes = Function(W)
-interior_nodes.x.array[:] = 1.0
 conducting_cells = np.unique(np.concatenate([ct.find(tag) for tag in omega_c]))
 conducting_dofs = np.unique(W.dofmap.list[conducting_cells].ravel())
-interior_nodes.x.array[conducting_dofs] = 0.0
-interior_nodes.x.array[fem.locate_dofs_topological(W, fdim, outer_facets)] = 0.0
+
+# Some ranks may not see conductivity cells and mark their nodes as interior when they are not.
+
+non_interior = Function(W)
+non_interior.x.array[:] = 0.0
+non_interior.x.array[conducting_dofs] = 1.0
+non_interior.x.array[fem.locate_dofs_topological(W, fdim, outer_facets)] = 1.0
+non_interior.x.scatter_reverse(la.InsertMode.add)
+interior_nodes = Function(W)
+interior_nodes.x.array[:] = np.where(non_interior.x.array > 0.0, 0.0, 1.0)
 interior_nodes.x.scatter_forward()
 pc.setHYPREAMSSetInteriorNodes(interior_nodes.x.petsc_vec)
 
